@@ -1,0 +1,174 @@
+# -*- coding: utf-8 -*-
+
+import tensorflow as tf
+tf.config.run_functions_eagerly(True)
+
+import pandas as pd
+import numpy as np
+from binance.client import Client
+from binance.enums import *
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense, LSTM, Bidirectional
+from datetime import datetime
+from tqdm import tqdm
+from tensorflow.keras.layers import Flatten
+
+# Definição dos parâmetros
+API_KEY = 'hruZgjj2PS9WCvNrT3scR726HlMLc0vnWWkLceUigMdbJECG2ay331Euh4qeDSjM'
+SECRET_KEY = 'ZReFgghppeiV6qQFwojT5EczFGjANLGOzkL7Q35j5P8hGopILGDnfY3queFSXfFO'
+PAIR = 'BTCUSDT'
+BATCH_SIZE = 32
+EPOCHS = 2
+INTERVAL = Client.KLINE_INTERVAL_1HOUR  # intervalo de 1 HORA
+LSTM_WINDOW = 20 # janela de 60 dias para a LSTM
+
+# Solicitação das datas de início e fim da amostragem
+inicio = input('Insira a data de inicio para amostragem (mm/dd/yyyy): ')
+fim = input('Insira a data de fim para amostragem (mm/dd/yyyy): ')
+
+# Converte as datas para objeto datetime
+inicio_dt = datetime.strptime(inicio, '%m/%d/%Y')
+fim_dt = datetime.strptime(fim, '%m/%d/%Y')
+
+# Calcula a quantidade de dias da amostragem
+dias_amostra = (fim_dt - inicio_dt).days
+
+# Cria a conexão com a API da Binance
+client = Client(API_KEY, SECRET_KEY)
+
+from tqdm import tqdm
+
+# Faz a leitura dos dados do par BTCUSDT na Binance
+print("Carregando dados da API...")
+klines = client.get_historical_klines(PAIR, INTERVAL, inicio, fim)
+
+# Cria a barra de progresso
+pbar = tqdm(total=len(klines))
+
+df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume',
+                                   'close_time', 'quote_asset_volume', 'num_trades',
+                                   'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+df['close'] = pd.to_numeric(df['close'])
+df = df[['timestamp', 'close']]
+print(df.head())  # exibe as primeiras 5 linhas do DataFrame
+
+# Converte as strings de timestamp para objetos datetime
+for kline in klines:
+    timestamp = pd.to_datetime(kline[0], unit='ms')
+    close = float(kline[4])
+    df = df._append({'timestamp': timestamp, 'close': close}, ignore_index=True)
+    pbar.update(1)
+
+# Fecha a barra de progresso
+pbar.close()
+
+#Cria um DataFrame do Pandas com os dados e renomeia as colunas
+df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'close_time', 'quote_asset_volume', 'number_of_trades', 'taker_buy_base_asset_volume', 'taker_buy_quote_asset_volume', 'ignore'])
+
+#Converte as colunas relevantes para números de ponto flutuante
+df['open'] = df['open'].astype(float)
+df['high'] = df['high'].astype(float)
+df['low'] = df['low'].astype(float)
+df['close'] = df['close'].astype(float)
+
+#Seleciona apenas as colunas relevantes e converte em um array NumPy
+data = df[['close']].to_numpy()
+
+#Normaliza os dados
+scaler = MinMaxScaler()
+data = scaler.fit_transform(data)
+
+# Cria as sequências de dados para a LSTM
+def create_sequences(data, window):
+    xs = []
+    ys = []
+
+    for i in range(window, len(data)):
+        xs.append(data[i-window:i])
+        ys.append(data[i])
+
+    return np.array(xs), np.array(ys)
+
+#Solicita as datas de início e fim da previsão
+inicio_prev = input('Insira a data de inicio para previsao (mm/dd/yyyy): ')
+fim_prev = input('Insira a data de fim para previsao (mm/dd/yyyy): ')
+
+#Converte as datas para objetos datetime
+df = pd.DataFrame(columns=['timestamp', 'close'])
+df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+inicio_prev_dt = datetime.strptime(inicio_prev, '%m/%d/%Y')
+fim_prev_dt = datetime.strptime(fim_prev, '%m/%d/%Y') + pd.DateOffset(days=1)
+
+#Calcula a quantidade de dias para a previsão
+dias_prev = (fim_prev_dt - inicio_prev_dt).days
+
+#Cria as sequências de treinamento e teste
+train_data = data[:-dias_prev]
+test_data = data[-(LSTM_WINDOW+dias_prev):]
+x_train, y_train = create_sequences(train_data, LSTM_WINDOW)
+x_test, y_test = create_sequences(test_data, LSTM_WINDOW)
+model = Sequential()
+model.add(Bidirectional(LSTM(256, input_shape=(LSTM_WINDOW, 1))))
+model.add(Dense(1))
+model.compile(optimizer='adam', loss='mse')
+
+# Treina o modelo
+model.fit(x_train, y_train, batch_size=BATCH_SIZE, epochs=EPOCHS, verbose=1)
+
+#Faz a previsão dos valores do par de negociação para os próximos dias_prev dias
+last_sequence = x_test[1]
+predicted_values = []
+
+for i in range(1, len(x_test)):
+    predicted_value = model.predict(x_test[i].reshape(1, -1))
+    predicted_values.append(predicted_value[0][0])
+    if len(predicted_values) == len(y_test):
+        break
+
+# Ajusta o tamanho do array de valores previstos para o tamanho do array de valores reais
+if len(predicted_values) > len(y_test):
+    predicted_values = predicted_values[:len(y_test)]
+elif len(predicted_values) < len(y_test):
+    y_test = y_test[:len(predicted_values)]
+
+#Reverte a normalização dos dados
+predicted_values = np.array(predicted_values).reshape(-1, 1)
+predicted_values = scaler.inverse_transform(predicted_values)
+y_test = scaler.inverse_transform(y_test)
+
+print(len(pd.date_range(start=inicio_prev_dt, end=fim_prev_dt, freq='D')[:-1]))
+print(len(predicted_values.ravel()))
+print(len(y_test.ravel()))
+
+dates = pd.date_range(start=inicio_prev_dt, end=fim_prev_dt, freq='D')[:-1]
+
+# Ajusta o tamanho do array de valores previstos para o tamanho do array de valores reais
+if len(predicted_values) > len(y_test):
+    predicted_values = predicted_values[:len(y_test)]
+elif len(predicted_values) < len(y_test):
+    y_test = y_test[:len(predicted_values)]
+
+# Cria um DataFrame para exibir os valores previstos e os valores reais dos dias de previsão
+df_pred = pd.DataFrame({'Data': pd.date_range(start=inicio_prev_dt, end=fim_prev_dt, freq='D')[:len(predicted_values)], 'Valor Previsto': predicted_values.ravel()})
+df_real = pd.DataFrame({'Data': pd.date_range(start=inicio_prev_dt, end=fim_prev_dt, freq='D')[:len(y_test)], 'Valor Real': y_test.ravel()})
+
+# Crie uma máscara booleana para identificar as datas futuras
+mask = df_real['Data'] >= datetime.now()
+
+# Aplique a máscara e substitua os valores futuros por NaN
+df_real.loc[mask, 'Valor Real'] = np.nan
+
+# Cria o DataFrame final mesclando df_pred e df_real
+df_final = pd.merge(df_pred, df_real, on='Data')
+
+# Exibe o resultado
+print(df_final)
+
+
+
+
+
+
+
