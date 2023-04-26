@@ -94,7 +94,8 @@ def generate_all_predictions(model, data, window, scaler):
         predicted_value = model.predict(x)  # Modifique a dimensão de entrada aqui
         predictions.append(predicted_value[0][0])
     predictions = np.array(predictions).reshape(-1, 1)
-    predictions = scaler.inverse_transform(predictions)
+    predictions = scaler.inverse_transform(np.array(predictions).reshape(-1, 1))
+
     return predictions
 
 
@@ -145,9 +146,6 @@ def preprocess_data(df, seq_len, target_column, scale_data=True):
         data[['close', 'rsi']] = scaled_data
 
     data = data[['close', 'rsi']].values
-    print("Shape of data:", data.shape)
-    print("Maximum value of Y:", data[:, 0].max())
-
     sequence_data = []
     target_data = []
 
@@ -287,8 +285,6 @@ def main():
     x_train, y_train = create_sequences(train_data, LSTM_WINDOW)
     x_test, y_test = create_sequences(test_data, LSTM_WINDOW)
 
-    print("Dimensão de entrada do modelo:", x_train.shape[1:])
-    print("Dimensão da saída do modelo:", y_train.shape[1:])
 
     model = create_lstm_model(LSTM_WINDOW)
     model = train_model(model, x_train, y_train, BATCH_SIZE, EPOCHS)
