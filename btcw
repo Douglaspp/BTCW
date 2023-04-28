@@ -22,6 +22,9 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from tqdm.notebook import tqdm
 from keras.layers import Reshape
 from keras.layers import Activation
+from keras.optimizers import Adam
+from keras.layers import Dropout, Conv1D, ReLU
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 
 
@@ -147,10 +150,14 @@ def get_coinbase_data(pair, interval, start_date, end_date):
 def preprocess_data(df, seq_len, target_column, scale_data=True):
     data = df.copy()
 
-    scaler = None
     if scale_data:
-        scaler = MinMaxScaler(feature_range=(0, 1))
-        scaled_data = scaler.fit_transform(data[[target_column]])
+        # Padronização de todas as colunas
+        scaler_all = StandardScaler()
+        data.iloc[:, 1:] = scaler_all.fit_transform(data.iloc[:, 1:])
+
+        # Criação do scaler para a coluna alvo após a padronização
+        scaler_target = MinMaxScaler(feature_range=(0, 1))
+        scaled_data = scaler_target.fit_transform(data[[target_column]])
         data[[target_column]] = scaled_data
 
     sequence_data = []
@@ -159,7 +166,8 @@ def preprocess_data(df, seq_len, target_column, scale_data=True):
     for i in range(len(data) - seq_len):
         if i + seq_len < len(data):
             sequence_data.append(data.iloc[i:i + seq_len])
-            target_data.append(data.iloc[i + seq_len][target_column])  # get only the target column
+            target_data.append(data.iloc[i + seq_len][target_column])
+
     print("Shape dos dados após preprocessamento: ", np.array(sequence_data).shape, np.array(target_data).shape)
 
     train_data = df.copy()
@@ -169,7 +177,7 @@ def preprocess_data(df, seq_len, target_column, scale_data=True):
     test_data = test_data.iloc[int(0.8 * len(test_data)):, :].values
     test_data = test_data[:, 1:]
 
-    return np.array(sequence_data), np.array(target_data), scaler
+    return np.array(sequence_data), np.array(target_data), scaler_target
 
 
 def create_sequences(df, seq_length):
@@ -188,22 +196,23 @@ def create_sequences(df, seq_length):
 
 
 
-
-
-
-
-
-def create_lstm_model(window):
+def create_lstm_model(window, scaler):
     print("Building LSTM model...")
     model = Sequential()
-    model.add(LSTM(64, input_shape=(window, 7)))
-    model.add(Dense(32, activation='relu'))
-    model.add(Dense(1))
-    model.add(Activation('linear'))
 
-    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+    # Adicionando a camada Conv1D
+    model.add(Conv1D(64, kernel_size=5, activation='relu', input_shape=(window, 7)))
+
+    model.add(LSTM(75, return_sequences=False))  # primeira camada LSTM com 75 neurônios
+
+    model.add(Dense(16, activation='relu'))  # camada Dense com 16 neurônios e ativação ReLU
+
+    model.add(Dense(1, activation='tanh'))  # camada de saída com ativação 'tanh'
+
+    optimizer = Adam(learning_rate=0.0001)  # taxa de aprendizado de 1e-4
+
+    model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
   
-
     def predict_with_scaling(X):
         if scaler is not None:
             X_scaled = scaler.transform(X)
@@ -218,6 +227,7 @@ def create_lstm_model(window):
     model.predict_with_scaling = predict_with_scaling
         
     return model
+
 
 
 def predict_values(model, x_test, scaler):
@@ -249,10 +259,11 @@ def main():
     inicio = '03/01/2023'#input('Insira a data de inicio para amostragem (mm/dd/yyyy): ')
     fim = '04/01/2023' #input('Insira a data de fim para amostragem (mm/dd/yyyy): ')
     klines = get_coinbase_data('BTC-USDT', INTERVAL, inicio, fim)
-    print("Klines", klines.head())
+    print(klines.head())
     # Adicione estas duas linhas abaixo
     sequence_length = 20  # Defina o tamanho da sequência que deseja usar
-    
+    LSTM_WINDOW = sequence_length
+
     sequence_data, target_data, scaler = preprocess_data(klines, sequence_length, 'close', scale_data=True)
     print("Número de linhas da sequência de dados:", sequence_data.shape[0])
     print("Shape dos dados após preprocessamento: ", sequence_data.shape, target_data.shape)
@@ -273,6 +284,21 @@ def main():
     train_data = data1[:train_size]
     test_data = data1[train_size:]
 
+    # Assumindo que train_data e test_data são seus dados de treinamento e teste
+
+    train_df = pd.DataFrame(train_data)
+    test_df = pd.DataFrame(test_data)
+
+    # Calculando algumas estatísticas básicas
+    train_stats = train_df.describe()
+    test_stats = test_df.describe()
+
+    print("Estatisticas dos Dados de Treinamento:")
+    print(train_stats)
+
+    print("\nEstatisticas dos Dados de Teste:")
+    print(test_stats)
+
     # Definir o tamanho da janela como o número de linhas da sequência de dados
     #LSTM_WINDOW = sequence_data.shape[0]
     print("Tipo de train_data:", type(train_data))
@@ -284,21 +310,14 @@ def main():
 
     x_train, y_train = create_sequences(train_data[:train_split], LSTM_WINDOW)
     x_test, y_test = create_sequences(train_data[train_split:], LSTM_WINDOW)
-    print("Dados de entrada do modelo:")
-    print("x_train shape:", x_train.shape)
-    print("y_train shape:", y_train.shape)
-    print("x_train[0]:", x_train[0])
-    print("y_train[0]:", y_train[0])
-    print("x_test shape:", x_test.shape)
-    print("y_test shape:", y_test.shape)
-    print("x_test[0]:", x_test[0])
-    print("y_test[0]:", y_test[0])
+   
 
     
-    model = create_lstm_model(LSTM_WINDOW)
+    model = create_lstm_model(LSTM_WINDOW, scaler)
 
-
-
+    # Train the model
+    model.fit(sequence_data, target_data, EPOCHS, BATCH_SIZE)
+ 
     print("\nTraining model...")
     print(model.summary())
     print("Treinamento concluído!")
