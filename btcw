@@ -25,6 +25,7 @@ from keras.layers import Activation
 from keras.optimizers import Adam
 from keras.layers import Dropout, Conv1D, ReLU
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from tensorflow.keras.layers import BatchNormalization
 
 
 
@@ -138,6 +139,9 @@ def get_coinbase_data(pair, interval, start_date, end_date):
     df['timestamp'] = pd.to_datetime(df['timestamp']).astype(np.int64) // 10**9
 
     df['close'] = pd.to_numeric(df['close'])
+
+    #df = df.drop(['volume'], axis=1)
+
     df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
 
     # Remova as primeiras 14 * 24 linhas de dados (14 dias) antes de retornar o DataFrame
@@ -195,24 +199,25 @@ def create_sequences(df, seq_length):
     return np.array(xs), np.array(ys)
 
 
-
 def create_lstm_model(window, scaler):
     print("Building LSTM model...")
     model = Sequential()
 
     # Adicionando a camada Conv1D
     model.add(Conv1D(64, kernel_size=5, activation='relu', input_shape=(window, 7)))
-
-    model.add(LSTM(75, return_sequences=False))  # primeira camada LSTM com 75 neurônios
+    model.add(BatchNormalization())
+    model.add(LSTM(75, return_sequences=True))  # primeira camada LSTM com 75 neurônios
 
     model.add(Dense(16, activation='relu'))  # camada Dense com 16 neurônios e ativação ReLU
+    model.add(Dropout(0.5))
 
     model.add(Dense(1, activation='tanh'))  # camada de saída com ativação 'tanh'
 
     optimizer = Adam(learning_rate=0.0001)  # taxa de aprendizado de 1e-4
 
     model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
-  
+   
+ 
     def predict_with_scaling(X):
         if scaler is not None:
             X_scaled = scaler.transform(X)
@@ -282,7 +287,9 @@ def main():
     data1 = klines.copy()
     train_size = int(0.8 * len(data1))
     train_data = data1[:train_size]
+    print ("train data:",train_data)
     test_data = data1[train_size:]
+    print ("test data:", test_data)
 
     # Assumindo que train_data e test_data são seus dados de treinamento e teste
 
@@ -299,24 +306,20 @@ def main():
     print("\nEstatisticas dos Dados de Teste:")
     print(test_stats)
 
-    # Definir o tamanho da janela como o número de linhas da sequência de dados
-    #LSTM_WINDOW = sequence_data.shape[0]
-    print("Tipo de train_data:", type(train_data))
 
     train_data = train_data.values  # Convert the DataFrame to a numpy array
 
-    # Definindo o ponto de divisão para 80% dos dados
-    train_split = int(0.8 * len(train_data))
-
-    x_train, y_train = create_sequences(train_data[:train_split], LSTM_WINDOW)
-    x_test, y_test = create_sequences(train_data[train_split:], LSTM_WINDOW)
-   
+    x_train, y_train = create_sequences(train_data[:train_size], LSTM_WINDOW)
+    x_test, y_test = create_sequences(train_data[train_size:], LSTM_WINDOW)
 
     
     model = create_lstm_model(LSTM_WINDOW, scaler)
 
     # Train the model
     model.fit(sequence_data, target_data, EPOCHS, BATCH_SIZE)
+
+    # Treinamento do modelo
+    # history = model.fit(x_train, y_train, epochs=EPOCHS, batch_size=BATCH_SIZE, validation_data=(x_test, y_test))
  
     print("\nTraining model...")
     print(model.summary())
