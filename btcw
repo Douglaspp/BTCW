@@ -21,7 +21,9 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from tqdm.notebook import tqdm
 from keras.layers import Reshape
-from keras.layers import Conv2D, Flatten, LSTM, Dense, Bidirectional
+from keras.layers import Activation
+
+
 
 
 tf.config.run_functions_eagerly(True)
@@ -35,7 +37,7 @@ PAIR = 'BTCUSDT'
 BATCH_SIZE = 32
 EPOCHS = 10
 INTERVAL = Client.KLINE_INTERVAL_1HOUR  # intervalo de 1 HORA
-LSTM_WINDOW = 20 # janela de 60 dias para a LSTM
+LSTM_WINDOW = 10 # janela de 60 dias para a LSTM
 x_train = []
 y_train = []
 
@@ -87,11 +89,12 @@ class TradingEnv(gym.Env):
 
 
 def generate_all_predictions(model, data, window, scaler):
+    
     predictions = []
     for i in range(window, len(data)):
         x = data[i-window:i, :]
         x = np.expand_dims(x, axis=0)
-        predicted_value = model.predict(x)  # Modifique a dimensão de entrada aqui
+        predicted_value = model.predict(np.expand_dims(x, axis=0))  # Modifique a dimensão de entrada aqui
         predictions.append(predicted_value[0][0])
     predictions = np.array(predictions).reshape(-1, 1)
     predictions = scaler.inverse_transform(np.array(predictions).reshape(-1, 1))
@@ -127,64 +130,95 @@ def get_coinbase_data(pair, interval, start_date, end_date):
     # Adicione o RSI aos dados do DataFrame
     df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+    # Converta a coluna 'timestamp' para timestamps Unix
+    df['timestamp'] = pd.to_datetime(df['timestamp']).astype(np.int64) // 10**9
+
     df['close'] = pd.to_numeric(df['close'])
     df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
 
     # Remova as primeiras 14 * 24 linhas de dados (14 dias) antes de retornar o DataFrame
     df = df.iloc[14 * 24:]
+
     return df
+
+
 
 def preprocess_data(df, seq_len, target_column, scale_data=True):
     data = df.copy()
-    print(data.head())  # imprime as primeiras linhas do dataframe
-    print("Max and Min values after scaling:")
-    print("Close - Max: {}, Min: {}".format(data['close'].max(), data['close'].min()))
-    print("RSI - Max: {}, Min: {}".format(data['rsi'].max(), data['rsi'].min()))
+
+    scaler = None
     if scale_data:
         scaler = MinMaxScaler(feature_range=(0, 1))
-        scaled_data = scaler.fit_transform(data[['close', 'rsi']])
-        data[['close', 'rsi']] = scaled_data
+        scaled_data = scaler.fit_transform(data[[target_column]])
+        data[[target_column]] = scaled_data
 
-    data = data[['close', 'rsi']].values
     sequence_data = []
     target_data = []
 
     for i in range(len(data) - seq_len):
         if i + seq_len < len(data):
-            sequence_data.append(data[i:i + seq_len])
-            target_data.append(data[i + seq_len, 0])
+            sequence_data.append(data.iloc[i:i + seq_len])
+            target_data.append(data.iloc[i + seq_len][target_column])  # get only the target column
+    print("Shape dos dados após preprocessamento: ", np.array(sequence_data).shape, np.array(target_data).shape)
 
-    return np.array(sequence_data), np.array(target_data)
+    train_data = df.copy()
+    train_data = train_data.iloc[:int(0.8 * len(train_data)), :].values
+    train_data = train_data[:, 1:]
+    test_data = df.copy()
+    test_data = test_data.iloc[int(0.8 * len(test_data)):, :].values
+    test_data = test_data[:, 1:]
+
+    return np.array(sequence_data), np.array(target_data), scaler
 
 
-
-def create_sequences(data, window):
+def create_sequences(df, seq_length):
+    if isinstance(df, pd.DataFrame):
+        df = df.values  # Convert the DataFrame to a numpy array only if df is a DataFrame
     xs = []
     ys = []
-    for i in range(window, len(data)):
-        x = data[i-window:i, :]
-        y = data[i, 0]
+
+    for i in range(len(df)-seq_length):
+        x = df[i:(i+seq_length)]
+        y = df[i+seq_length][4]  # 4 é o índice da coluna 'close' nos dados convertidos em numpy array
         xs.append(x)
         ys.append(y)
-    return np.array(xs), np.array(ys).reshape(-1, 1)
+
+    return np.array(xs), np.array(ys)
+
+
+
+
+
+
 
 
 def create_lstm_model(window):
+    print("Building LSTM model...")
     model = Sequential()
-    model.add(Conv2D(filters=64, kernel_size=(3,3), activation='relu', padding='same', input_shape=(window, window, 2)))
-    model.add(GlobalAveragePooling2D())
-    model.add(Reshape((1,1,64)))
-    model.add(Bidirectional(LSTM(256)))
-    model.add(Dense(20))
-    model.compile(optimizer='adam', loss='mse')
+    model.add(LSTM(64, input_shape=(window, 7)))
+    model.add(Dense(32, activation='relu'))
+    model.add(Dense(1))
+    model.add(Activation('linear'))
+
+    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
+  
+
+    def predict_with_scaling(X):
+        if scaler is not None:
+            X_scaled = scaler.transform(X)
+        else:
+            X_scaled = X
+        y_pred = model.predict(X_scaled)
+        if scaler is not None:
+            y_pred = scaler.inverse_transform(y_pred)
+            
+        return y_pred
+
+    model.predict_with_scaling = predict_with_scaling
+        
     return model
 
-
-
-def train_model(model, x_train, y_train, batch_size, epochs):
-    tqdm_callback = TqdmKerasCallback()
-    model.fit(x_train, y_train, batch_size=batch_size, epochs=epochs, verbose=0, callbacks=[tqdm_callback])
-    return model
 
 def predict_values(model, x_test, scaler):
     predicted_values = []
@@ -206,91 +240,74 @@ def generate_actions(rl_agent, predictions):
         obs, _, done, _ = env.step(action)
         if done:
             break
-
+    print("Ações geradas pelo agente de RL: ", actions)
     return np.array(sequence_data), np.array(target_data)
 
 
-def create_sequences(data, window):
-    xs = []
-    ys = []
-    for i in range(window, len(data)):
-        x = data[i-window:i, :]
-        xs.append(x)
-        ys.append(data[i-window:i, 0])
-    return np.array(xs), np.array(ys)
-
-
-
-def create_lstm_model(window):
-    model = Sequential()
-    model.add(Conv2D(filters=64, kernel_size=(3,3), activation='relu', padding='same', input_shape=(window, window, 2)))
-    model.add(Flatten())
-    model.add(Reshape((window, -1)))
-    model.add(Bidirectional(LSTM(256)))
-    model.add(Reshape((1, -1)))  # adiciona camada de reshape para mudar o shape para (batch_size, 1)
-    model.add(Dense(1))
-    model.compile(optimizer='adam', loss='mae')
-    return model
-
-
-
-
-
-def predict_values(model, x_test, scaler):
-    predicted_values = []
-    for i in range(1, len(x_test)):
-        x = x_test[i].reshape(1, x_test.shape[1], 1)  # Use input_dim=1
-        predicted_value = model.predict(x)
-        predicted_values.append(predicted_value[0][0])
-    predicted_values = np.array(predicted_values).reshape(-1, 1)
-    predicted_values = scaler.inverse_transform(predicted_values)
-    return predicted_values
-
-
-def generate_actions(rl_agent, predictions):
-    actions = []
-    env = TradingEnv(predictions)
-    obs = env.reset()
-    for _ in range(len(predictions) - 1):
-        action, _ = rl_agent.predict(obs)
-        actions.append(action)
-        obs, _, done, _ = env.step(action)
-        if done:
-            break
-    return actions
 
 def main():
-    inicio = input('Insira a data de inicio para amostragem (mm/dd/yyyy): ')
-    fim = input('Insira a data de fim para amostragem (mm/dd/yyyy): ')
+    inicio = '03/01/2023'#input('Insira a data de inicio para amostragem (mm/dd/yyyy): ')
+    fim = '04/01/2023' #input('Insira a data de fim para amostragem (mm/dd/yyyy): ')
     klines = get_coinbase_data('BTC-USDT', INTERVAL, inicio, fim)
+    print("Klines", klines.head())
     # Adicione estas duas linhas abaixo
     sequence_length = 20  # Defina o tamanho da sequência que deseja usar
     
-    data, scaler = preprocess_data(klines, sequence_length, 'close', scale_data=True)
+    sequence_data, target_data, scaler = preprocess_data(klines, sequence_length, 'close', scale_data=True)
+    print("Número de linhas da sequência de dados:", sequence_data.shape[0])
+    print("Shape dos dados após preprocessamento: ", sequence_data.shape, target_data.shape)
+    
 
-    inicio_prev = input('Insira a data de inicio para previsão (mm/dd/yyyy): ')
-    fim_prev = input('Insira a data de fim para previsão (mm/dd/yyyy): ')
+    inicio_prev = '04/01/2023' #input('Insira a data de inicio para previsão (mm/dd/yyyy): ')
+    fim_prev ='05/25/2023' #input('Insira a data de fim para previsão (mm/dd/yyyy): ')
 
     # Calcular o número de dias de previsão com base nas datas inicial e final de previsão
     from datetime import datetime
-    inicio_prev_dt = datetime.strptime(inicio_prev, "%m/%d/%Y")
-    fim_prev_dt = datetime.strptime(fim_prev, "%m/%d/%Y")
+    inicio_prev_dt =  datetime.strptime(inicio_prev, "%m/%d/%Y")
+    fim_prev_dt =  datetime.strptime(fim_prev, "%m/%d/%Y")
     dias_prev = (fim_prev_dt - inicio_prev_dt).days
 
         # Separação dos dados de treinamento e teste
+    data1 = klines.copy()
+    train_size = int(0.8 * len(data1))
+    train_data = data1[:train_size]
+    test_data = data1[train_size:]
 
-    dias_prev = int(0.2 * len(data))
-    train_data = data[:-dias_prev]
-    test_data = data[-(LSTM_WINDOW+dias_prev):]
-    x_train, y_train = create_sequences(train_data, LSTM_WINDOW)
-    x_test, y_test = create_sequences(test_data, LSTM_WINDOW)
+    # Definir o tamanho da janela como o número de linhas da sequência de dados
+    #LSTM_WINDOW = sequence_data.shape[0]
+    print("Tipo de train_data:", type(train_data))
 
+    train_data = train_data.values  # Convert the DataFrame to a numpy array
 
+    # Definindo o ponto de divisão para 80% dos dados
+    train_split = int(0.8 * len(train_data))
+
+    x_train, y_train = create_sequences(train_data[:train_split], LSTM_WINDOW)
+    x_test, y_test = create_sequences(train_data[train_split:], LSTM_WINDOW)
+    print("Dados de entrada do modelo:")
+    print("x_train shape:", x_train.shape)
+    print("y_train shape:", y_train.shape)
+    print("x_train[0]:", x_train[0])
+    print("y_train[0]:", y_train[0])
+    print("x_test shape:", x_test.shape)
+    print("y_test shape:", y_test.shape)
+    print("x_test[0]:", x_test[0])
+    print("y_test[0]:", y_test[0])
+
+    
     model = create_lstm_model(LSTM_WINDOW)
-    model = train_model(model, x_train, y_train, BATCH_SIZE, EPOCHS)
+
+
+
+    print("\nTraining model...")
+    print(model.summary())
+    print("Treinamento concluído!")
+
+
 
     # Gere previs�es LSTM para todos os pontos no conjunto de treinamento
     train_predictions = generate_all_predictions(model, train_data, LSTM_WINDOW, scaler)
+    print(train_predictions.shape)
 
     # Crie o ambiente de RL com as previs�es LSTM do per�odo de amostragem
     train_env = DummyVecEnv([lambda: TradingEnv(train_predictions)])
