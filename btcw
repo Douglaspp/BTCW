@@ -38,7 +38,7 @@ tf.data.experimental.enable_debug_mode()
 API_KEY = 'hruZgjj2PS9WCvNrT3scR726HlMLc0vnWWkLceUigMdbJECG2ay331Euh4qeDSjM'
 SECRET_KEY = 'ZReFgghppeiV6qQFwojT5EczFGjANLGOzkL7Q35j5P8hGopILGDnfY3queFSXfFO'
 PAIR = 'BTCUSDT'
-BATCH_SIZE = 32
+BATCH_SIZE = 4
 EPOCHS = 10
 INTERVAL = Client.KLINE_INTERVAL_1HOUR  # intervalo de 1 HORA
 LSTM_WINDOW = 10 # janela de 60 dias para a LSTM
@@ -92,20 +92,6 @@ class TradingEnv(gym.Env):
         return obs, reward, done, {}
 
 
-def generate_all_predictions(model, data, window, scaler):
-    
-    predictions = []
-    for i in range(window, len(data)):
-        x = data[i-window:i, :]
-        x = np.expand_dims(x, axis=0)
-        predicted_value = model.predict(np.expand_dims(x, axis=0))  # Modifique a dimensão de entrada aqui
-        predictions.append(predicted_value[0][0])
-    predictions = np.array(predictions).reshape(-1, 1)
-    predictions = scaler.inverse_transform(np.array(predictions).reshape(-1, 1))
-
-    return predictions
-
-
 def get_coinbase_data(pair, interval, start_date, end_date):
     exchange = ccxt.coinbasepro()
     timeframe = '1h'  # intervalo de 1 hora
@@ -150,16 +136,21 @@ def get_coinbase_data(pair, interval, start_date, end_date):
     return df
 
 
+def normalize_data(data):
+    scaler = StandardScaler()
+    normalized_data = scaler.fit_transform(data)
+    return normalized_data, scaler
 
-def preprocess_data(df, seq_len, target_column, scale_data=True):
+
+def preprocess_data(df, seq_len, target_column, normalize_data=True):
     data = df.copy()
 
-    if scale_data:
-        # Padronização de todas as colunas
+    if normalize_data:
+        # Normalization of all columns
         scaler_all = StandardScaler()
         data.iloc[:, 1:] = scaler_all.fit_transform(data.iloc[:, 1:])
 
-        # Criação do scaler para a coluna alvo após a padronização
+        # Creation of the scaler for the target column after normalization
         scaler_target = MinMaxScaler(feature_range=(0, 1))
         scaled_data = scaler_target.fit_transform(data[[target_column]])
         data[[target_column]] = scaled_data
@@ -172,7 +163,7 @@ def preprocess_data(df, seq_len, target_column, scale_data=True):
             sequence_data.append(data.iloc[i:i + seq_len])
             target_data.append(data.iloc[i + seq_len][target_column])
 
-    print("Shape dos dados após preprocessamento: ", np.array(sequence_data).shape, np.array(target_data).shape)
+    print("Shape of data after preprocessing: ", np.array(sequence_data).shape, np.array(target_data).shape)
 
     train_data = df.copy()
     train_data = train_data.iloc[:int(0.8 * len(train_data)), :].values
@@ -182,7 +173,6 @@ def preprocess_data(df, seq_len, target_column, scale_data=True):
     test_data = test_data[:, 1:]
 
     return np.array(sequence_data), np.array(target_data), scaler_target
-
 
 def create_sequences(df, seq_length):
     if isinstance(df, pd.DataFrame):
@@ -199,7 +189,7 @@ def create_sequences(df, seq_length):
     return np.array(xs), np.array(ys)
 
 
-def create_lstm_model(window, scaler):
+def create_lstm_model(window):
     print("Building LSTM model...")
     model = Sequential()
 
@@ -216,33 +206,31 @@ def create_lstm_model(window, scaler):
     optimizer = Adam(learning_rate=0.0001)  # taxa de aprendizado de 1e-4
 
     model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
-   
- 
-    def predict_with_scaling(X):
-        if scaler is not None:
-            X_scaled = scaler.transform(X)
-        else:
-            X_scaled = X
-        y_pred = model.predict(X_scaled)
-        if scaler is not None:
-            y_pred = scaler.inverse_transform(y_pred)
-            
-        return y_pred
-
-    model.predict_with_scaling = predict_with_scaling
-        
+       
     return model
 
 
+def generate_all_predictions(model, data, window, scaler_target):
+    predictions = []
+    for i in tqdm(range(window, len(data))):
+        x = data[i-window:i, :]
+        x = np.expand_dims(x, axis=0)
+        predicted_value = model.predict(x)
+        predictions.append(predicted_value[0][0])
+    predictions = np.array(predictions).reshape(-1, 1)
+    predictions = scaler_target.inverse_transform(predictions)
 
-def predict_values(model, x_test, scaler):
+    return predictions
+
+
+def predict_values(model, x_test, scaler_target):
     predicted_values = []
     for i in range(1, len(x_test)):
         x = x_test[i].reshape(1, x_test.shape[1], 2)  # Modifique a dimensão de entrada aqui
         predicted_value = model.predict(x)
         predicted_values.append(predicted_value[0][0])
     predicted_values = np.array(predicted_values).reshape(-1, 1)
-    predicted_values = scaler.inverse_transform(predicted_values)
+    predicted_values = scaler_target.inverse_transform(predicted_values)
     return predicted_values
 
 def generate_actions(rl_agent, predictions):
@@ -269,7 +257,8 @@ def main():
     sequence_length = 20  # Defina o tamanho da sequência que deseja usar
     LSTM_WINDOW = sequence_length
 
-    sequence_data, target_data, scaler = preprocess_data(klines, sequence_length, 'close', scale_data=True)
+    sequence_data, target_data, scaler_target = preprocess_data(klines, sequence_length, 'close')
+
     print("Número de linhas da sequência de dados:", sequence_data.shape[0])
     print("Shape dos dados após preprocessamento: ", sequence_data.shape, target_data.shape)
     
@@ -287,33 +276,19 @@ def main():
     data1 = klines.copy()
     train_size = int(0.8 * len(data1))
     train_data = data1[:train_size]
-    print ("train data:",train_data)
     test_data = data1[train_size:]
-    print ("test data:", test_data)
+    
 
     # Assumindo que train_data e test_data são seus dados de treinamento e teste
 
     train_df = pd.DataFrame(train_data)
     test_df = pd.DataFrame(test_data)
 
-    # Calculando algumas estatísticas básicas
-    train_stats = train_df.describe()
-    test_stats = test_df.describe()
-
-    print("Estatisticas dos Dados de Treinamento:")
-    print(train_stats)
-
-    print("\nEstatisticas dos Dados de Teste:")
-    print(test_stats)
-
-
-    train_data = train_data.values  # Convert the DataFrame to a numpy array
-
-    x_train, y_train = create_sequences(train_data[:train_size], LSTM_WINDOW)
-    x_test, y_test = create_sequences(train_data[train_size:], LSTM_WINDOW)
+    x_train, y_train = create_sequences(train_data, LSTM_WINDOW)
+    x_test, y_test = create_sequences(test_data, LSTM_WINDOW)
 
     
-    model = create_lstm_model(LSTM_WINDOW, scaler)
+    model = create_lstm_model(LSTM_WINDOW)
 
     # Train the model
     model.fit(sequence_data, target_data, EPOCHS, BATCH_SIZE)
@@ -324,16 +299,17 @@ def main():
     print("\nTraining model...")
     print(model.summary())
     print("Treinamento concluído!")
-
-
+    print(sequence_data.shape)
+    print(train_data.shape)
+   
 
     # Gere previs�es LSTM para todos os pontos no conjunto de treinamento
-    train_predictions = generate_all_predictions(model, train_data, LSTM_WINDOW, scaler)
+    train_predictions = generate_all_predictions(model, train_df, LSTM_WINDOW, scaler_target)
     print(train_predictions.shape)
 
     # Crie o ambiente de RL com as previs�es LSTM do per�odo de amostragem
     train_env = DummyVecEnv([lambda: TradingEnv(train_predictions)])
-    predicted_values = predict_values(model, x_test, scaler)
+    predicted_values = predict_values(model, x_test, scaler_target)
 
     # Treine o agente de RL usando o algoritmo PPO
     total_timesteps = 10000
@@ -344,7 +320,7 @@ def main():
 
     # Gere a��es de compra e venda para o per�odo de previs�o
     actions = generate_actions(rl_agent, predicted_values.ravel())
-    y_test = scaler.inverse_transform(y_test)
+    y_test = scaler_target.inverse_transform(y_test)
     df_pred = pd.DataFrame({'Data': pd.date_range(start=inicio_prev_dt, end=fim_prev_dt, freq='D')[:len(predicted_values)], 'Valor Previsto': predicted_values.ravel()})
     df_real = pd.DataFrame({'Data': pd.date_range(start=inicio_prev_dt, end=fim_prev_dt, freq='D')[:len(y_test)], 'Valor Real': y_test.ravel()})
     df_actions = pd.DataFrame({'Data': pd.date_range(start=inicio_prev_dt, end=fim_prev_dt, freq='D')[:len(actions)], 'Acao': actions})
