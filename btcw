@@ -1,4 +1,4 @@
-#@title
+##@title
 # -*- coding: utf-8 -*-
 import pandas as pd
 import numpy as np
@@ -26,8 +26,8 @@ from keras.optimizers import Adam
 from keras.layers import Dropout, Conv1D, ReLU
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from tensorflow.keras.layers import BatchNormalization
-
-
+from keras.callbacks import EarlyStopping
+from keras.layers import Flatten
 
 
 tf.config.run_functions_eagerly(True)
@@ -38,12 +38,13 @@ tf.data.experimental.enable_debug_mode()
 API_KEY = 'hruZgjj2PS9WCvNrT3scR726HlMLc0vnWWkLceUigMdbJECG2ay331Euh4qeDSjM'
 SECRET_KEY = 'ZReFgghppeiV6qQFwojT5EczFGjANLGOzkL7Q35j5P8hGopILGDnfY3queFSXfFO'
 PAIR = 'BTCUSDT'
-BATCH_SIZE = 4
+BATCH_SIZE = 30
 EPOCHS = 10
 INTERVAL = Client.KLINE_INTERVAL_1HOUR  # intervalo de 1 HORA
-LSTM_WINDOW = 10 # janela de 60 dias para a LSTM
+LSTM_WINDOW = 60 # janela de 60 dias para a LSTM
 x_train = []
 y_train = []
+patience = 5
 
 class TqdmRLCallback(BaseCallback):
     def __init__(self, tqdm_object):
@@ -142,8 +143,8 @@ def normalize_data(data):
     return normalized_data, scaler
 
 
-def preprocess_data(df, seq_len, target_column, normalize_data=True):
-    data = df.copy()
+def preprocess_data(klines, seq_len, target_column, normalize_data=True):
+    data = klines.copy()
 
     if normalize_data:
         # Normalization of all columns
@@ -163,30 +164,27 @@ def preprocess_data(df, seq_len, target_column, normalize_data=True):
             sequence_data.append(data.iloc[i:i + seq_len])
             target_data.append(data.iloc[i + seq_len][target_column])
 
+
+    train_data = sequence_data[:int(0.8 * len(sequence_data))]
+    test_data = sequence_data[int(0.8 * len(sequence_data)):]
+
     print("Shape of data after preprocessing: ", np.array(sequence_data).shape, np.array(target_data).shape)
 
-    train_data = df.copy()
-    train_data = train_data.iloc[:int(0.8 * len(train_data)), :].values
-    train_data = train_data[:, 1:]
-    test_data = df.copy()
-    test_data = test_data.iloc[int(0.8 * len(test_data)):, :].values
-    test_data = test_data[:, 1:]
+    return train_data, test_data, target_data, scaler_target, sequence_data, scaler_all
 
-    return np.array(sequence_data), np.array(target_data), scaler_target
 
-def create_sequences(df, seq_length):
-    if isinstance(df, pd.DataFrame):
-        df = df.values  # Convert the DataFrame to a numpy array only if df is a DataFrame
-    xs = []
-    ys = []
+def create_sequences(sequence_data, target_data, seq_len):
+    sequences = []
+    targets = []
 
-    for i in range(len(df)-seq_length):
-        x = df[i:(i+seq_length)]
-        y = df[i+seq_length][4]  # 4 é o índice da coluna 'close' nos dados convertidos em numpy array
-        xs.append(x)
-        ys.append(y)
+    for i in range(len(sequence_data) - seq_len):
+        sequences.append(sequence_data[i:i+seq_len])
+        targets.append(target_data[i+seq_len])
 
-    return np.array(xs), np.array(ys)
+    return np.array(sequences), np.array(targets)
+
+
+
 
 
 def create_lstm_model(window):
@@ -197,7 +195,7 @@ def create_lstm_model(window):
     model.add(Conv1D(64, kernel_size=5, activation='relu', input_shape=(window, 7)))
     model.add(BatchNormalization())
     model.add(LSTM(75, return_sequences=True))  # primeira camada LSTM com 75 neurônios
-
+    model.add(Flatten())
     model.add(Dense(16, activation='relu'))  # camada Dense com 16 neurônios e ativação ReLU
     model.add(Dropout(0.5))
 
@@ -205,15 +203,17 @@ def create_lstm_model(window):
 
     optimizer = Adam(learning_rate=0.0001)  # taxa de aprendizado de 1e-4
 
-    model.compile(optimizer=optimizer, loss='mse', metrics=['mae'])
+    #model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'], run_eagerly=True)
+
+    model.compile(optimizer='adam', loss='mse',metrics=['accuracy'])
        
     return model
 
 
-def generate_all_predictions(model, data, window, scaler_target):
+def generate_all_predictions(model,klines, window, scaler_target):
     predictions = []
-    for i in tqdm(range(window, len(data))):
-        x = data[i-window:i, :]
+    for i in tqdm(range(window, len(klines))):
+        x = klines[i-window:i, :]
         x = np.expand_dims(x, axis=0)
         predicted_value = model.predict(x)
         predictions.append(predicted_value[0][0])
@@ -254,14 +254,9 @@ def main():
     klines = get_coinbase_data('BTC-USDT', INTERVAL, inicio, fim)
     print(klines.head())
     # Adicione estas duas linhas abaixo
-    sequence_length = 20  # Defina o tamanho da sequência que deseja usar
-    LSTM_WINDOW = sequence_length
-
-    sequence_data, target_data, scaler_target = preprocess_data(klines, sequence_length, 'close')
-
-    print("Número de linhas da sequência de dados:", sequence_data.shape[0])
-    print("Shape dos dados após preprocessamento: ", sequence_data.shape, target_data.shape)
+    seq_len = LSTM_WINDOW  # Defina o tamanho da sequência que deseja usar
     
+
 
     inicio_prev = '04/01/2023' #input('Insira a data de inicio para previsão (mm/dd/yyyy): ')
     fim_prev ='05/25/2023' #input('Insira a data de fim para previsão (mm/dd/yyyy): ')
@@ -272,39 +267,55 @@ def main():
     fim_prev_dt =  datetime.strptime(fim_prev, "%m/%d/%Y")
     dias_prev = (fim_prev_dt - inicio_prev_dt).days
 
-        # Separação dos dados de treinamento e teste
-    data1 = klines.copy()
-    train_size = int(0.8 * len(data1))
-    train_data = data1[:train_size]
-    test_data = data1[train_size:]
-    
+    train_data, test_data, target_data, scaler_target, sequence_data, scaler_all = preprocess_data(klines, seq_len, target_column='close')
 
-    # Assumindo que train_data e test_data são seus dados de treinamento e teste
+    train_target = target_data[:len(train_data)]
+    test_target = target_data[len(train_data):]
 
-    train_df = pd.DataFrame(train_data)
-    test_df = pd.DataFrame(test_data)
-
-    x_train, y_train = create_sequences(train_data, LSTM_WINDOW)
-    x_test, y_test = create_sequences(test_data, LSTM_WINDOW)
 
     
     model = create_lstm_model(LSTM_WINDOW)
+    # Print the model summary
+    model.summary()
+
+    
+    # Convert the data to numpy arrays
+    train_data = np.array(train_data)
+    test_data = np.array(test_data)
+    target_data = np.array(target_data)
+    train_target = np.array(train_target)
+    test_target = np.array(test_target)
+
+    print("Dimensões de train_data:", train_data.shape)
+    print("Dimensões de test_data:", test_data.shape)
+    print("Dimensões de target_data:", target_data.shape)
+    print("Dimensões de train_target:", train_target.shape)
+    print("Dimensões de test_target:", test_target.shape)
+
+
 
     # Train the model
-    model.fit(sequence_data, target_data, EPOCHS, BATCH_SIZE)
+    #model.compile(optimizer='adam', loss='mse')
+    #model.fit(train_data, target_data, EPOCHS, BATCH_SIZE, validation_data=(test_data, target_data[l))
 
+    #print("Dimensões de train_data: ", train_data.shape)
+    #print("Dimensões de test_data: ", test_data.shape)
+    #print("Dimensões de target_data: ", target_data.shape)
+
+    early_stop = EarlyStopping(monitor='val_loss', patience=patience)
+
+    history = model.fit(train_data, train_target, EPOCHS, BATCH_SIZE, validation_data=(test_data, test_target), callbacks=[early_stop])
     # Treinamento do modelo
-    # history = model.fit(x_train, y_train, epochs=EPOCHS, batch_size=BATCH_SIZE, validation_data=(x_test, y_test))
+    #history = model.fit(train_data, train_target, epochs=EPOCHS, batch_size=BATCH_SIZE, validation_data=(test_data,test_target),  verbose=1)
  
     print("\nTraining model...")
     print(model.summary())
     print("Treinamento concluído!")
-    print(sequence_data.shape)
-    print(train_data.shape)
+    
    
 
     # Gere previs�es LSTM para todos os pontos no conjunto de treinamento
-    train_predictions = generate_all_predictions(model, train_df, LSTM_WINDOW, scaler_target)
+    train_predictions = generate_all_predictions(model,klines, LSTM_WINDOW, scaler_target)
     print(train_predictions.shape)
 
     # Crie o ambiente de RL com as previs�es LSTM do per�odo de amostragem
