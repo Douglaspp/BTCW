@@ -1,9 +1,12 @@
-#import tensorflow as tf
+import tensorflow as tf
 tf.config.run_functions_eagerly(True)
+`tf.data.experimental.enable_debug_mode()
 import ccxt
 import ta
+import time
 import pandas as pd
 import numpy as np
+import matplotlib.pyplot as plt
 from binance.client import Client
 from binance.enums import *
 from sklearn.preprocessing import MinMaxScaler
@@ -13,35 +16,75 @@ from datetime import datetime
 from tqdm import tqdm
 from tensorflow.keras.layers import Flatten
 from ta.momentum import RSIIndicator
+from datetime import datetime, timedelta
+
 
 # Definição dos parâmetros
 PAIR = 'BTC/USDT'
 PREDICT_DAYS = 10
 BATCH_SIZE = 32
-EPOCHS = 15
+EPOCHS = 2
 INTERVAL = '1h'  # intervalo de 1 HORA
 LSTM_WINDOW = 20 # janela de 60 dias para a LSTM
+LIMIT = 1000  # limite de 1000 barras (máximo permitido)
 
-# Solicitação das datas de início e fim da amostragem
-inicio ="01/01/2022" #input('Insira a data de inicio para amostragem (mm/dd/yyyy): ')
-fim = "04/30/2023" #input('Insira a data de fim para amostragem (mm/dd/yyyy): ')
+# Configurações
+exchange_name = 'coinbasepro'  # Use 'binance', 'kraken', 'coinbasepro', etc.
+pair = 'BTC/USDT'  # Par de moedas
+interval = '1h'  # Intervalo das velas
+inicio = "01/01/2022"
+fim = "04/30/2023"
 
-# Converte as datas para objeto datetime
+# Criando a conexão com a exchange
+exchange = getattr(ccxt, exchange_name)()
+
+# Converte as datas para timestamp em milissegundos
 inicio_dt = datetime.strptime(inicio, '%m/%d/%Y')
+inicio_ts = int(inicio_dt.timestamp() * 1000)
 fim_dt = datetime.strptime(fim, '%m/%d/%Y')
+fim_ts = int(fim_dt.timestamp() * 1000)
 
-# Calcula a quantidade de dias da amostragem
-dias_amostra = (fim_dt - inicio_dt).days
+# Cria uma lista vazia para armazenar todos os dados
+all_data = []
 
-# Cria a conexão com a API do Coinbase Pro
-exchange = ccxt.coinbasepro()
+# Calcula a diferença em horas
+total_hours = int((fim_dt - inicio_dt).total_seconds() / 3600)
 
-# Faz a leitura dos dados do par BTCUSDT na Coinbase Pro
-print("Carregando dados da API...")
-klines = exchange.fetch_ohlcv(PAIR, INTERVAL, since=exchange.parse8601(inicio), limit=dias_amostra*24) # 24 horas por dia
 
-# Cria a barra de progresso
-pbar = tqdm(total=len(klines))
+print ("BUSCANDO DADOS DA EXCHANGE...")
+
+# Inicializa a barra de progresso
+pbar = tqdm(total=total_hours)
+
+
+
+while inicio_ts < fim_ts:
+
+    # Busca os dados
+    data = exchange.fetch_ohlcv(pair, interval, since=inicio_ts)
+
+    # Se não retornar dados, sai do loop
+    if not data:
+        break
+
+    # Adiciona os dados à nossa lista
+    all_data += data
+
+    # Atualiza o timestamp de início para o timestamp da última vela + intervalo
+    inicio_ts = data[-1][0] + 1
+
+    # Atualiza a barra de progresso
+    pbar.update(len(data))
+
+    # Pausa para evitar atingir o limite de requisições da API
+    time.sleep(exchange.rateLimit / 1000)
+
+pbar.close()
+
+print("Número total de velas coletadas: ", len(all_data))
+
+klines=all_data
+
 
 df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
 
@@ -50,22 +93,9 @@ df['close'] = pd.to_numeric(df['close'])
 df = df[['timestamp', 'close']]
 
 
-# Converte as strings de timestamp para objetos datetime
-for kline in klines:
-    timestamp = pd.to_datetime(kline[0], unit='ms')
-    close = float(kline[4])
-    df = df._append({'timestamp': timestamp, 'close': close}, ignore_index=True)
-    pbar.update(1)
-
-# Fecha a barra de progresso
-pbar.close()
 
 print(df.head())
-#df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-#df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-#df['close'] = pd.to_numeric(df['close'])
-#df = df[['timestamp', 'close']]
-#print(df.head())
+
 
 # Seleciona apenas as colunas relevantes e converte em um array NumPy
 data = df[['close']].to_numpy()
@@ -76,14 +106,17 @@ df['RSI'] = rsi_indicator.rsi()
 
 # Excluir as primeiras linhas que não têm RSI calculado
 df = df.dropna()
+print("Número de pontos de dados após remover NaNs: ", len(df))
+
 
 # Crie um novo scaler para a coluna 'close'
 scaler_close = MinMaxScaler()
-df[['close']] = scaler_close.fit_transform(df[['close']].values)
+df.loc[:, 'close'] = scaler_close.fit_transform(df[['close']].values)
 
 # Crie um novo scaler para a coluna 'RSI'
 scaler_rsi = MinMaxScaler()
-df[['RSI']] = scaler_rsi.fit_transform(df[['RSI']].values)
+df.loc[:, 'RSI'] = scaler_rsi.fit_transform(df[['RSI']].values)
+
 
 def create_sequences(data, window):
     xs = []
@@ -100,7 +133,7 @@ data = df[['close', 'RSI']].to_numpy()
     
 # Solicita as datas de início e fim da previsão
 inicio_prev ="05/01/2023" #input('Insira a data de inicio para previsao (mm/dd/yyyy): ')
-fim_prev = "05/30/2023" #input('Insira a data de fim para previsao (mm/dd/yyyy): ')
+fim_prev = "05/02/2023" #input('Insira a data de fim para previsao (mm/dd/yyyy): ')
 
 # Converte as datas para objetos datetime
 df = pd.DataFrame(columns=['timestamp', 'close'])
@@ -113,10 +146,11 @@ dias_prev = (fim_prev_dt - inicio_prev_dt).days
 
 # Calcula o índice onde os dados de treinamento devem terminar e os dados de teste devem começar
 train_size = int(len(data) * 0.8)
+test_size = len(data) - train_size
 
 # Divide os dados em conjuntos de treinamento e teste
 train_data = data[:train_size]
-test_data = data[train_size - LSTM_WINDOW:]  # subtraímos LSTM_WINDOW para ter uma sequência completa para o primeiro ponto de teste
+test_data = data[train_size:] # subtraímos LSTM_WINDOW para ter uma sequência completa para o primeiro ponto de teste
 
 # Cria as sequências de treinamento e teste
 x_train, y_train = create_sequences(train_data, LSTM_WINDOW)
@@ -132,6 +166,8 @@ model.add(Bidirectional(LSTM(units=64, return_sequences=True), input_shape=(LSTM
 model.add(Bidirectional(LSTM(units=32)))
 model.add(Dense(1))
 
+model.summary()
+
 # Compila e treina o modelo
 model.compile(optimizer='adam', loss='mean_squared_error')
 model.fit(x_train, y_train, batch_size=BATCH_SIZE, epochs=EPOCHS)
@@ -142,17 +178,17 @@ predicted_values = []
 # atualiza last_sequence
 last_sequence = x_test[-1]
 
-for _ in range(dias_prev):
+for i in range(dias_prev * 24):  # prevendo os próximos "dias_prev" dias, hora a hora
     predicted_value = model.predict(np.array([last_sequence]))
     predicted_values.append(predicted_value[0][0])
     last_sequence = np.roll(last_sequence, -1, axis=0)
-    last_sequence[-1] = np.array([predicted_value[0][0], last_sequence[-1, -1]]) 
+    last_sequence[-1] = predicted_value[0][0]  # usa sempre o último valor previsto
 
-     
-    if _ >= len(y_test):
+    if i >= len(y_test):
         last_sequence[-1, -1] = predicted_value[0][0] # Usa o último valor previsto para datas futuras
     else:
-        last_sequence[-1, -1] = y_test[_] # Insere o valor real no lugar do valor previsto para datas futuras
+        last_sequence[-1, -1] = y_test[i] # Insere o valor real no lugar do valor previsto para datas futuras
+# Insere o valor real no lugar do valor previsto para datas futuras
 
 
 # Reverte a normalização para 'close'
@@ -170,3 +206,19 @@ df_prev = pd.DataFrame({'timestamp': df['timestamp'], 'Valor Previsto': predicte
 
 print(df_prev)
 print(df)
+
+
+# Adiciona os dados de amostragem ao DataFrame de previsão
+df_prev = pd.concat([df[['timestamp', 'close']], df_prev], axis=0)
+
+
+# Plot dos valores de 'close' da amostragem
+plt.plot(df['timestamp'], df['close'], color='blue')
+
+# Configurações do gráfico
+plt.xlabel('Data')
+plt.ylabel('Preço')
+plt.title('Preço do par de negociação ao longo do tempo')
+
+# Mostra o gráfico
+plt.show()
