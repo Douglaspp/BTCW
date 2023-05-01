@@ -227,6 +227,8 @@ plt.plot(df_original['timestamp'], df_original['close'], color='blue')
 plt.plot(df_prev['timestamp'], df_prev['Valor Previsto'], linestyle='--', color='green')
 plt.plot(df_prev['timestamp'], df_prev['Valor Previsto'], linestyle='--', color='red')
 
+# Adiciona a linha que representa o início dos dados de teste
+plt.axvline(df_original['timestamp'].iloc[train_size], color='black', linestyle='--')
 
 # Configurações do gráfico
 plt.xlabel('Data')
@@ -234,25 +236,7 @@ plt.ylabel('Preço')
 plt.title('Preço do par de negociação ao longo do tempo')
 
 # Legenda
-plt.legend(['Dados de Treinamento', 'Dados de Teste', 'Valores Previstos'])
-
-# Mostra o gráfico
-plt.show()
-
-# Encontra o último timestamp do conjunto de teste
-test_end = df_original['timestamp'].iloc[-1]
-
-# Plota o gráfico do conjunto de teste em um plot separado para o período de amostragem
-plt.plot(df_original.loc[df_original['timestamp'] <= test_end, 'timestamp'], df_original.loc[df_original['timestamp'] <= test_end, 'close'], color='blue')
-plt.plot(df_prev['timestamp'], df_prev['Valor Previsto'], linestyle='--', color='red')
-
-# Configurações do gráfico
-plt.xlabel('Data')
-plt.ylabel('Preço')
-plt.title('Preço do par de negociação ao longo do tempo')
-
-# Legenda
-plt.legend(['Dados de Treinamento/Teste', 'Valores Previstos'])
+plt.legend(['Dados de Treinamento', 'Valores Previstos', 'Dados de Teste'])
 
 # Mostra o gráfico
 plt.show()
