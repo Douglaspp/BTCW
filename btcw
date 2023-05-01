@@ -1,347 +1,172 @@
-##@title
-# -*- coding: utf-8 -*-
+#import tensorflow as tf
+tf.config.run_functions_eagerly(True)
+import ccxt
+import ta
 import pandas as pd
 import numpy as np
-import ta
-import ccxt
-from tensorflow.keras.callbacks import Callback
-from tqdm.keras import TqdmCallback
 from binance.client import Client
 from binance.enums import *
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, LSTM, Bidirectional
 from datetime import datetime
-#from tqdm import tqdm
-import tensorflow as tf
-import gym
-from stable_baselines3.common.callbacks import BaseCallback
-from gym import spaces
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
-from tqdm.notebook import tqdm
-from keras.layers import Reshape
-from keras.layers import Activation
-from keras.optimizers import Adam
-from keras.layers import Dropout, Conv1D, ReLU
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
-from tensorflow.keras.layers import BatchNormalization
-from keras.callbacks import EarlyStopping
-from keras.layers import Flatten
+from tqdm import tqdm
+from tensorflow.keras.layers import Flatten
+from ta.momentum import RSIIndicator
+
+# Definição dos parâmetros
+PAIR = 'BTC/USDT'
+PREDICT_DAYS = 10
+BATCH_SIZE = 32
+EPOCHS = 15
+INTERVAL = '1h'  # intervalo de 1 HORA
+LSTM_WINDOW = 20 # janela de 60 dias para a LSTM
+
+# Solicitação das datas de início e fim da amostragem
+inicio ="01/01/2022" #input('Insira a data de inicio para amostragem (mm/dd/yyyy): ')
+fim = "04/30/2023" #input('Insira a data de fim para amostragem (mm/dd/yyyy): ')
+
+# Converte as datas para objeto datetime
+inicio_dt = datetime.strptime(inicio, '%m/%d/%Y')
+fim_dt = datetime.strptime(fim, '%m/%d/%Y')
+
+# Calcula a quantidade de dias da amostragem
+dias_amostra = (fim_dt - inicio_dt).days
+
+# Cria a conexão com a API do Coinbase Pro
+exchange = ccxt.coinbasepro()
+
+# Faz a leitura dos dados do par BTCUSDT na Coinbase Pro
+print("Carregando dados da API...")
+klines = exchange.fetch_ohlcv(PAIR, INTERVAL, since=exchange.parse8601(inicio), limit=dias_amostra*24) # 24 horas por dia
+
+# Cria a barra de progresso
+pbar = tqdm(total=len(klines))
+
+df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+
+df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+df['close'] = pd.to_numeric(df['close'])
+df = df[['timestamp', 'close']]
 
 
-tf.config.run_functions_eagerly(True)
-tf.data.experimental.enable_debug_mode()
+# Converte as strings de timestamp para objetos datetime
+for kline in klines:
+    timestamp = pd.to_datetime(kline[0], unit='ms')
+    close = float(kline[4])
+    df = df._append({'timestamp': timestamp, 'close': close}, ignore_index=True)
+    pbar.update(1)
 
+# Fecha a barra de progresso
+pbar.close()
 
-# Defini��o dos par�metros
-API_KEY = 'hruZgjj2PS9WCvNrT3scR726HlMLc0vnWWkLceUigMdbJECG2ay331Euh4qeDSjM'
-SECRET_KEY = 'ZReFgghppeiV6qQFwojT5EczFGjANLGOzkL7Q35j5P8hGopILGDnfY3queFSXfFO'
-PAIR = 'BTCUSDT'
-BATCH_SIZE = 30
-EPOCHS = 10
-INTERVAL = Client.KLINE_INTERVAL_1HOUR  # intervalo de 1 HORA
-LSTM_WINDOW = 60 # janela de 60 dias para a LSTM
-x_train = []
-y_train = []
-patience = 5
+print(df.head())
+#df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+#df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+#df['close'] = pd.to_numeric(df['close'])
+#df = df[['timestamp', 'close']]
+#print(df.head())
 
-class TqdmRLCallback(BaseCallback):
-    def __init__(self, tqdm_object):
-        super(TqdmRLCallback, self).__init__()
-        self.tqdm_object = tqdm_object
+# Seleciona apenas as colunas relevantes e converte em um array NumPy
+data = df[['close']].to_numpy()
 
-    def _on_step(self) -> bool:
-        self.tqdm_object.update(1)
-        return True
+# Calcular o indicador técnico RSI
+rsi_indicator = RSIIndicator(close = df['close'], window = 14)
+df['RSI'] = rsi_indicator.rsi()
 
-class TqdmKerasCallback(Callback):
-    def on_train_begin(self, logs=None):
-        self.epochs = self.params['epochs']
-        self.steps = self.params['steps']
-        self.epoch_progress_bar = tqdm(total=self.epochs, desc="Epochs", position=0)
-    
-    def on_epoch_end(self, epoch, logs=None):
-        self.epoch_progress_bar.update(1)
-        
-    def on_train_end(self, logs=None):
-        self.epoch_progress_bar.close()
+# Excluir as primeiras linhas que não têm RSI calculado
+df = df.dropna()
 
-class TradingEnv(gym.Env):
-    def __init__(self, data):
-        super(TradingEnv, self).__init__()
-        self.data = data
-        self.current_step = 0
-        self.action_space = spaces.Discrete(3)  # 0: Hold, 1: Buy, 2: Sell
-        self.observation_space = spaces.Box(low=0, high=np.inf, shape=(2,), dtype=np.float32)
-    def reset(self):
-        self.current_step = 0
-        return self._next_observation()
-    def _next_observation(self):
-        return np.array([self.data[self.current_step], self.current_step])
-    def step(self, action):
-        self.current_step += 1
-        current_price = self.data[self.current_step]
-        previous_price = self.data[self.current_step - 1]
-        reward = 0
-        if action == 1:  # Comprar
-            reward = previous_price - current_price
-        elif action == 2:  # Vender
-            reward = current_price - previous_price
-        done = self.current_step == len(self.data) - 1
-        obs = self._next_observation()
-        return obs, reward, done, {}
+# Crie um novo scaler para a coluna 'close'
+scaler_close = MinMaxScaler()
+df[['close']] = scaler_close.fit_transform(df[['close']].values)
 
+# Crie um novo scaler para a coluna 'RSI'
+scaler_rsi = MinMaxScaler()
+df[['RSI']] = scaler_rsi.fit_transform(df[['RSI']].values)
 
-def get_coinbase_data(pair, interval, start_date, end_date):
-    exchange = ccxt.coinbasepro()
-    timeframe = '1h'  # intervalo de 1 hora
+def create_sequences(data, window):
+    xs = []
+    ys = []
 
-    # Ajuste da data de início para incluir 14 dias a mais para calcular o RSI corretamente
-    start_date = datetime.strptime(start_date, '%m/%d/%Y') - pd.DateOffset(days=14)
-    end_date = datetime.strptime(end_date, '%m/%d/%Y')
+    for i in range(window, len(data)):
+        xs.append(data[i-window:i])
+        ys.append(data[i, 0])  # seleciona apenas o preço de fechamento como alvo
 
-    klines = []
-    current_date = start_date
+    return np.array(xs), np.array(ys)
 
-    with tqdm(desc="Buscando dados") as pbar:
-        while current_date < end_date:
-            since = exchange.parse8601(current_date.isoformat())
-            limit = 1000
-            new_klines = exchange.fetch_ohlcv(pair, timeframe, since, limit)
-            klines.extend(new_klines)
-            pbar.update(len(new_klines))
-
-            if not new_klines:
-                break
-
-            last_kline_timestamp = new_klines[-1][0]
-            current_date = datetime.utcfromtimestamp(last_kline_timestamp / 1000) + pd.DateOffset(hours=1)
-
-    # Adicione o RSI aos dados do DataFrame
-    df = pd.DataFrame(klines, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-
-    # Converta a coluna 'timestamp' para timestamps Unix
-    df['timestamp'] = pd.to_datetime(df['timestamp']).astype(np.int64) // 10**9
-
-    df['close'] = pd.to_numeric(df['close'])
-
-    #df = df.drop(['volume'], axis=1)
-
-    df['rsi'] = ta.momentum.RSIIndicator(df['close'], window=14).rsi()
-
-    # Remova as primeiras 14 * 24 linhas de dados (14 dias) antes de retornar o DataFrame
-    df = df.iloc[14 * 24:]
-
-    return df
-
-
-def normalize_data(data):
-    scaler = StandardScaler()
-    normalized_data = scaler.fit_transform(data)
-    return normalized_data, scaler
-
-
-def preprocess_data(klines, seq_len, target_column, normalize_data=True):
-    data = klines.copy()
-
-    if normalize_data:
-        # Normalization of all columns
-        scaler_all = StandardScaler()
-        data.iloc[:, 1:] = scaler_all.fit_transform(data.iloc[:, 1:])
-
-        # Creation of the scaler for the target column after normalization
-        scaler_target = MinMaxScaler(feature_range=(0, 1))
-        scaled_data = scaler_target.fit_transform(data[[target_column]])
-        data[[target_column]] = scaled_data
-
-    sequence_data = []
-    target_data = []
-
-    for i in range(len(data) - seq_len):
-        if i + seq_len < len(data):
-            sequence_data.append(data.iloc[i:i + seq_len])
-            target_data.append(data.iloc[i + seq_len][target_column])
-
-
-    train_data = sequence_data[:int(0.8 * len(sequence_data))]
-    test_data = sequence_data[int(0.8 * len(sequence_data)):]
-
-    print("Shape of data after preprocessing: ", np.array(sequence_data).shape, np.array(target_data).shape)
-
-    return train_data, test_data, target_data, scaler_target, sequence_data, scaler_all
-
-
-def create_sequences(sequence_data, target_data, seq_len):
-    sequences = []
-    targets = []
-
-    for i in range(len(sequence_data) - seq_len):
-        sequences.append(sequence_data[i:i+seq_len])
-        targets.append(target_data[i+seq_len])
-
-    return np.array(sequences), np.array(targets)
-
-
-
-
-
-def create_lstm_model(window):
-    print("Building LSTM model...")
-    model = Sequential()
-
-    # Adicionando a camada Conv1D
-    model.add(Conv1D(64, kernel_size=5, activation='relu', input_shape=(window, 7)))
-    model.add(BatchNormalization())
-    model.add(LSTM(75, return_sequences=True))  # primeira camada LSTM com 75 neurônios
-    model.add(Flatten())
-    model.add(Dense(16, activation='relu'))  # camada Dense com 16 neurônios e ativação ReLU
-    model.add(Dropout(0.5))
-
-    model.add(Dense(1, activation='tanh'))  # camada de saída com ativação 'tanh'
-
-    optimizer = Adam(learning_rate=0.0001)  # taxa de aprendizado de 1e-4
-
-    #model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'], run_eagerly=True)
-
-    model.compile(optimizer='adam', loss='mse',metrics=['accuracy'])
-       
-    return model
-
-
-def generate_all_predictions(model,klines, window, scaler_target):
-    predictions = []
-    for i in tqdm(range(window, len(klines))):
-        x = klines[i-window:i, :]
-        x = np.expand_dims(x, axis=0)
-        predicted_value = model.predict(x)
-        predictions.append(predicted_value[0][0])
-    predictions = np.array(predictions).reshape(-1, 1)
-    predictions = scaler_target.inverse_transform(predictions)
-
-    return predictions
-
-
-def predict_values(model, x_test, scaler_target):
-    predicted_values = []
-    for i in range(1, len(x_test)):
-        x = x_test[i].reshape(1, x_test.shape[1], 2)  # Modifique a dimensão de entrada aqui
-        predicted_value = model.predict(x)
-        predicted_values.append(predicted_value[0][0])
-    predicted_values = np.array(predicted_values).reshape(-1, 1)
-    predicted_values = scaler_target.inverse_transform(predicted_values)
-    return predicted_values
-
-def generate_actions(rl_agent, predictions):
-    actions = []
-    env = TradingEnv(predictions)
-    obs = env.reset()
-    for _ in range(len(predictions) - 1):
-        action, _ = rl_agent.predict(obs)
-        actions.append(action)
-        obs, _, done, _ = env.step(action)
-        if done:
-            break
-    print("Ações geradas pelo agente de RL: ", actions)
-    return np.array(sequence_data), np.array(target_data)
-
-
-
-def main():
-    inicio = '03/01/2023'#input('Insira a data de inicio para amostragem (mm/dd/yyyy): ')
-    fim = '04/01/2023' #input('Insira a data de fim para amostragem (mm/dd/yyyy): ')
-    klines = get_coinbase_data('BTC-USDT', INTERVAL, inicio, fim)
-    print(klines.head())
-    # Adicione estas duas linhas abaixo
-    seq_len = LSTM_WINDOW  # Defina o tamanho da sequência que deseja usar
-    
-
-
-    inicio_prev = '04/01/2023' #input('Insira a data de inicio para previsão (mm/dd/yyyy): ')
-    fim_prev ='05/25/2023' #input('Insira a data de fim para previsão (mm/dd/yyyy): ')
-
-    # Calcular o número de dias de previsão com base nas datas inicial e final de previsão
-    from datetime import datetime
-    inicio_prev_dt =  datetime.strptime(inicio_prev, "%m/%d/%Y")
-    fim_prev_dt =  datetime.strptime(fim_prev, "%m/%d/%Y")
-    dias_prev = (fim_prev_dt - inicio_prev_dt).days
-
-    train_data, test_data, target_data, scaler_target, sequence_data, scaler_all = preprocess_data(klines, seq_len, target_column='close')
-
-    train_target = target_data[:len(train_data)]
-    test_target = target_data[len(train_data):]
-
+data = df[['close', 'RSI']].to_numpy()
 
     
-    model = create_lstm_model(LSTM_WINDOW)
-    # Print the model summary
-    model.summary()
+# Solicita as datas de início e fim da previsão
+inicio_prev ="05/01/2023" #input('Insira a data de inicio para previsao (mm/dd/yyyy): ')
+fim_prev = "05/30/2023" #input('Insira a data de fim para previsao (mm/dd/yyyy): ')
 
-    
-    # Convert the data to numpy arrays
-    train_data = np.array(train_data)
-    test_data = np.array(test_data)
-    target_data = np.array(target_data)
-    train_target = np.array(train_target)
-    test_target = np.array(test_target)
+# Converte as datas para objetos datetime
+df = pd.DataFrame(columns=['timestamp', 'close'])
+df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+inicio_prev_dt = datetime.strptime(inicio_prev, '%m/%d/%Y')
+fim_prev_dt = datetime.strptime(fim_prev, '%m/%d/%Y') + pd.DateOffset(days=1)
 
-    print("Dimensões de train_data:", train_data.shape)
-    print("Dimensões de test_data:", test_data.shape)
-    print("Dimensões de target_data:", target_data.shape)
-    print("Dimensões de train_target:", train_target.shape)
-    print("Dimensões de test_target:", test_target.shape)
+# Calcula a quantidade de dias para a previsão
+dias_prev = (fim_prev_dt - inicio_prev_dt).days
+
+# Calcula o índice onde os dados de treinamento devem terminar e os dados de teste devem começar
+train_size = int(len(data) * 0.8)
+
+# Divide os dados em conjuntos de treinamento e teste
+train_data = data[:train_size]
+test_data = data[train_size - LSTM_WINDOW:]  # subtraímos LSTM_WINDOW para ter uma sequência completa para o primeiro ponto de teste
+
+# Cria as sequências de treinamento e teste
+x_train, y_train = create_sequences(train_data, LSTM_WINDOW)
+x_test, y_test = create_sequences(test_data, LSTM_WINDOW)
+
+# Redimensiona os arrays para terem a forma correta para a LSTM
+x_train = x_train.reshape((x_train.shape[0], x_train.shape[1], 2))
+x_test = x_test.reshape((x_test.shape[0], x_test.shape[1], 2))
+
+# Cria o modelo LSTM bidirecional
+model = Sequential()
+model.add(Bidirectional(LSTM(units=64, return_sequences=True), input_shape=(LSTM_WINDOW, 2)))
+model.add(Bidirectional(LSTM(units=32)))
+model.add(Dense(1))
+
+# Compila e treina o modelo
+model.compile(optimizer='adam', loss='mean_squared_error')
+model.fit(x_train, y_train, batch_size=BATCH_SIZE, epochs=EPOCHS)
+
+# Faz a previsão dos valores do par de negociação para os próximos dias_prev dias
+predicted_values = []
+
+# atualiza last_sequence
+last_sequence = x_test[-1]
+
+for _ in range(dias_prev):
+    predicted_value = model.predict(np.array([last_sequence]))
+    predicted_values.append(predicted_value[0][0])
+    last_sequence = np.roll(last_sequence, -1, axis=0)
+    last_sequence[-1] = np.array([predicted_value[0][0], last_sequence[-1, -1]]) 
+
+     
+    if _ >= len(y_test):
+        last_sequence[-1, -1] = predicted_value[0][0] # Usa o último valor previsto para datas futuras
+    else:
+        last_sequence[-1, -1] = y_test[_] # Insere o valor real no lugar do valor previsto para datas futuras
 
 
+# Reverte a normalização para 'close'
+predicted_values = np.array(predicted_values).reshape(-1, 1)
+predicted_values = scaler_close.inverse_transform(predicted_values)
+y_test = y_test.reshape(-1, 1)
+y_test = scaler_close.inverse_transform(y_test)
 
-    # Train the model
-    #model.compile(optimizer='adam', loss='mse')
-    #model.fit(train_data, target_data, EPOCHS, BATCH_SIZE, validation_data=(test_data, target_data[l))
+# Adiciona a coluna 'timestamp' ao DataFrame 'df'
+df['timestamp'] = pd.date_range(start=fim_dt + pd.Timedelta(hours=1), periods=len(predicted_values), freq='H')
 
-    #print("Dimensões de train_data: ", train_data.shape)
-    #print("Dimensões de test_data: ", test_data.shape)
-    #print("Dimensões de target_data: ", target_data.shape)
+# Cria um DataFrame para exibir os valores previstos e os valores reais dos últimos dias
+print(f"Tamanho dos arrays - previsto: {len(predicted_values)} / real: {len(y_test)}")
+df_prev = pd.DataFrame({'timestamp': df['timestamp'], 'Valor Previsto': predicted_values.ravel()})
 
-    early_stop = EarlyStopping(monitor='val_loss', patience=patience)
-
-    history = model.fit(train_data, train_target, EPOCHS, BATCH_SIZE, validation_data=(test_data, test_target), callbacks=[early_stop])
-    # Treinamento do modelo
-    #history = model.fit(train_data, train_target, epochs=EPOCHS, batch_size=BATCH_SIZE, validation_data=(test_data,test_target),  verbose=1)
- 
-    print("\nTraining model...")
-    print(model.summary())
-    print("Treinamento concluído!")
-    
-   
-
-    # Gere previs�es LSTM para todos os pontos no conjunto de treinamento
-    train_predictions = generate_all_predictions(model,klines, LSTM_WINDOW, scaler_target)
-    print(train_predictions.shape)
-
-    # Crie o ambiente de RL com as previs�es LSTM do per�odo de amostragem
-    train_env = DummyVecEnv([lambda: TradingEnv(train_predictions)])
-    predicted_values = predict_values(model, x_test, scaler_target)
-
-    # Treine o agente de RL usando o algoritmo PPO
-    total_timesteps = 10000
-    with tqdm(total=total_timesteps, desc="Treinando o agente RL", unit="steps", leave=False) as pbar:
-        rl_agent = PPO('MlpPolicy', train_env, verbose=1)
-        callback = TqdmRLCallback(pbar)
-        rl_agent.learn(total_timesteps=total_timesteps, callback=callback)
-
-    # Gere a��es de compra e venda para o per�odo de previs�o
-    actions = generate_actions(rl_agent, predicted_values.ravel())
-    y_test = scaler_target.inverse_transform(y_test)
-    df_pred = pd.DataFrame({'Data': pd.date_range(start=inicio_prev_dt, end=fim_prev_dt, freq='D')[:len(predicted_values)], 'Valor Previsto': predicted_values.ravel()})
-    df_real = pd.DataFrame({'Data': pd.date_range(start=inicio_prev_dt, end=fim_prev_dt, freq='D')[:len(y_test)], 'Valor Real': y_test.ravel()})
-    df_actions = pd.DataFrame({'Data': pd.date_range(start=inicio_prev_dt, end=fim_prev_dt, freq='D')[:len(actions)], 'Acao': actions})
-    df_final = pd.merge(df_pred, df_real, on='Data')
-    df_final = pd.merge(df_final, df_actions, on='Data')
-    mask = df_real['Data'] >= datetime.now()
-    df_final.loc[mask, 'Valor Real'] = np.nan
-    action_mapping = {0: "Manter", 1: "Comprar", 2: "Vender"}
-    df_final['Acao'] = df_final['Acao'].map(action_mapping)
-    print(df_final)
-
-if __name__ == '__main__':
-    main()
+print(df_prev)
+print(df)
