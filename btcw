@@ -1,6 +1,5 @@
 import tensorflow as tf
 tf.config.run_functions_eagerly(True)
-`tf.data.experimental.enable_debug_mode()
 import ccxt
 import ta
 import time
@@ -17,13 +16,16 @@ from tqdm import tqdm
 from tensorflow.keras.layers import Flatten
 from ta.momentum import RSIIndicator
 from datetime import datetime, timedelta
+from tensorflow.keras.layers import Dropout
+from tensorflow.keras.callbacks import EarlyStopping
+
 
 
 # Definição dos parâmetros
 PAIR = 'BTC/USDT'
 PREDICT_DAYS = 10
 BATCH_SIZE = 32
-EPOCHS = 2
+EPOCHS = 15
 INTERVAL = '1h'  # intervalo de 1 HORA
 LSTM_WINDOW = 20 # janela de 60 dias para a LSTM
 LIMIT = 1000  # limite de 1000 barras (máximo permitido)
@@ -79,7 +81,8 @@ while inicio_ts < fim_ts:
     # Pausa para evitar atingir o limite de requisições da API
     time.sleep(exchange.rateLimit / 1000)
 
-pbar.close()
+#pbar.close()
+
 
 print("Número total de velas coletadas: ", len(all_data))
 
@@ -95,6 +98,7 @@ df = df[['timestamp', 'close']]
 
 
 print(df.head())
+df_original = df.copy()
 
 
 # Seleciona apenas as colunas relevantes e converte em um array NumPy
@@ -104,19 +108,20 @@ data = df[['close']].to_numpy()
 rsi_indicator = RSIIndicator(close = df['close'], window = 14)
 df['RSI'] = rsi_indicator.rsi()
 
-# Excluir as primeiras linhas que não têm RSI calculado
-df = df.dropna()
+# Remove os valores NaN do DataFrame
+df = df.dropna().reset_index(drop=True)
+
+# Excluir as primeiras linhas que não têm RSI calculadodf = df.dropna().reset_index(drop=True)
 print("Número de pontos de dados após remover NaNs: ", len(df))
 
 
 # Crie um novo scaler para a coluna 'close'
 scaler_close = MinMaxScaler()
-df.loc[:, 'close'] = scaler_close.fit_transform(df[['close']].values)
+df[['close']] = scaler_close.fit_transform(df[['close']].values)
 
 # Crie um novo scaler para a coluna 'RSI'
 scaler_rsi = MinMaxScaler()
-df.loc[:, 'RSI'] = scaler_rsi.fit_transform(df[['RSI']].values)
-
+df[['RSI']] = scaler_rsi.fit_transform(df[['RSI']].values)
 
 def create_sequences(data, window):
     xs = []
@@ -129,6 +134,7 @@ def create_sequences(data, window):
     return np.array(xs), np.array(ys)
 
 data = df[['close', 'RSI']].to_numpy()
+
 
     
 # Solicita as datas de início e fim da previsão
@@ -163,14 +169,23 @@ x_test = x_test.reshape((x_test.shape[0], x_test.shape[1], 2))
 # Cria o modelo LSTM bidirecional
 model = Sequential()
 model.add(Bidirectional(LSTM(units=64, return_sequences=True), input_shape=(LSTM_WINDOW, 2)))
+model.add(Dropout(0.2))
 model.add(Bidirectional(LSTM(units=32)))
+model.add(Dropout(0.2))
 model.add(Dense(1))
 
 model.summary()
 
-# Compila e treina o modelo
+print("TREINANDO A REDE NEURAL BI-LSTM...")
+
+# Cria um objeto EarlyStopping
+early_stop = EarlyStopping(monitor='val_loss', patience=2)
+
+# Compila e treina o modelo com EarlyStopping
 model.compile(optimizer='adam', loss='mean_squared_error')
-model.fit(x_train, y_train, batch_size=BATCH_SIZE, epochs=EPOCHS)
+model.fit(x_train, y_train, batch_size=BATCH_SIZE, epochs=EPOCHS, validation_data=(x_test, y_test), callbacks=[early_stop])
+
+print ("CALCULANDO AS PREVISOES...")
 
 # Faz a previsão dos valores do par de negociação para os próximos dias_prev dias
 predicted_values = []
@@ -188,7 +203,7 @@ for i in range(dias_prev * 24):  # prevendo os próximos "dias_prev" dias, hora 
         last_sequence[-1, -1] = predicted_value[0][0] # Usa o último valor previsto para datas futuras
     else:
         last_sequence[-1, -1] = y_test[i] # Insere o valor real no lugar do valor previsto para datas futuras
-# Insere o valor real no lugar do valor previsto para datas futuras
+
 
 
 # Reverte a normalização para 'close'
@@ -205,20 +220,39 @@ print(f"Tamanho dos arrays - previsto: {len(predicted_values)} / real: {len(y_te
 df_prev = pd.DataFrame({'timestamp': df['timestamp'], 'Valor Previsto': predicted_values.ravel()})
 
 print(df_prev)
-print(df)
-
-
-# Adiciona os dados de amostragem ao DataFrame de previsão
-df_prev = pd.concat([df[['timestamp', 'close']], df_prev], axis=0)
 
 
 # Plot dos valores de 'close' da amostragem
-plt.plot(df['timestamp'], df['close'], color='blue')
+plt.plot(df_original['timestamp'], df_original['close'], color='blue')
+plt.plot(df_prev['timestamp'], df_prev['Valor Previsto'], linestyle='--', color='green')
+plt.plot(df_prev['timestamp'], df_prev['Valor Previsto'], linestyle='--', color='red')
+
 
 # Configurações do gráfico
 plt.xlabel('Data')
 plt.ylabel('Preço')
 plt.title('Preço do par de negociação ao longo do tempo')
+
+# Legenda
+plt.legend(['Dados de Treinamento', 'Dados de Teste', 'Valores Previstos'])
+
+# Mostra o gráfico
+plt.show()
+
+# Encontra o último timestamp do conjunto de teste
+test_end = df_original['timestamp'].iloc[-1]
+
+# Plota o gráfico do conjunto de teste em um plot separado para o período de amostragem
+plt.plot(df_original.loc[df_original['timestamp'] <= test_end, 'timestamp'], df_original.loc[df_original['timestamp'] <= test_end, 'close'], color='blue')
+plt.plot(df_prev['timestamp'], df_prev['Valor Previsto'], linestyle='--', color='red')
+
+# Configurações do gráfico
+plt.xlabel('Data')
+plt.ylabel('Preço')
+plt.title('Preço do par de negociação ao longo do tempo')
+
+# Legenda
+plt.legend(['Dados de Treinamento/Teste', 'Valores Previstos'])
 
 # Mostra o gráfico
 plt.show()
