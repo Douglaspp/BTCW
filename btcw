@@ -3,6 +3,7 @@ tf.config.run_functions_eagerly(True)
 import ccxt
 import ta
 import time
+import pytz
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -18,6 +19,7 @@ from ta.momentum import RSIIndicator
 from datetime import datetime, timedelta
 from tensorflow.keras.layers import Dropout
 from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.layers import SimpleRNN
 
 
 
@@ -25,25 +27,32 @@ from tensorflow.keras.callbacks import EarlyStopping
 PAIR = 'BTC/USDT'
 PREDICT_DAYS = 10
 BATCH_SIZE = 32
-EPOCHS = 15
+EPOCHS = 10
 INTERVAL = '1h'  # intervalo de 1 HORA
 LSTM_WINDOW = 20 # janela de 60 dias para a LSTM
 LIMIT = 1000  # limite de 1000 barras (máximo permitido)
+input_dim = 2
+data_range = timedelta(days=365)
+
+# Define o fuso horário para o horário de Brasília
+brasil_tz = pytz.timezone('America/Sao_Paulo')
+
 
 # Configurações
 exchange_name = 'coinbasepro'  # Use 'binance', 'kraken', 'coinbasepro', etc.
 pair = 'BTC/USDT'  # Par de moedas
 interval = '1h'  # Intervalo das velas
-inicio = "01/01/2022"
-fim = "04/30/2023"
 
 # Criando a conexão com a exchange
 exchange = getattr(ccxt, exchange_name)()
 
 # Converte as datas para timestamp em milissegundos
-inicio_dt = datetime.strptime(inicio, '%m/%d/%Y')
+# Define o período de busca dos dados
+fim_dt = datetime.now()
+inicio_dt = fim_dt - timedelta(days=365)
+
+# Converte as datas para timestamp em milissegundos
 inicio_ts = int(inicio_dt.timestamp() * 1000)
-fim_dt = datetime.strptime(fim, '%m/%d/%Y')
 fim_ts = int(fim_dt.timestamp() * 1000)
 
 # Cria uma lista vazia para armazenar todos os dados
@@ -53,7 +62,7 @@ all_data = []
 total_hours = int((fim_dt - inicio_dt).total_seconds() / 3600)
 
 
-print ("BUSCANDO DADOS DA EXCHANGE...")
+print ("BUSCANDO DADOS BTC-USD (PERIODO DE 1 ANO)...")
 
 # Inicializa a barra de progresso
 pbar = tqdm(total=total_hours)
@@ -81,7 +90,7 @@ while inicio_ts < fim_ts:
     # Pausa para evitar atingir o limite de requisições da API
     time.sleep(exchange.rateLimit / 1000)
 
-#pbar.close()
+pbar.close()
 
 
 print("Número total de velas coletadas: ", len(all_data))
@@ -135,20 +144,9 @@ def create_sequences(data, window):
 
 data = df[['close', 'RSI']].to_numpy()
 
-
-    
-# Solicita as datas de início e fim da previsão
-inicio_prev ="05/01/2023" #input('Insira a data de inicio para previsao (mm/dd/yyyy): ')
-fim_prev = "05/02/2023" #input('Insira a data de fim para previsao (mm/dd/yyyy): ')
-
-# Converte as datas para objetos datetime
-df = pd.DataFrame(columns=['timestamp', 'close'])
-df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-inicio_prev_dt = datetime.strptime(inicio_prev, '%m/%d/%Y')
-fim_prev_dt = datetime.strptime(fim_prev, '%m/%d/%Y') + pd.DateOffset(days=1)
-
 # Calcula a quantidade de dias para a previsão
-dias_prev = (fim_prev_dt - inicio_prev_dt).days
+dias_prev = 1
+
 
 # Calcula o índice onde os dados de treinamento devem terminar e os dados de teste devem começar
 train_size = int(len(data) * 0.8)
@@ -168,11 +166,15 @@ x_test = x_test.reshape((x_test.shape[0], x_test.shape[1], 2))
 
 # Cria o modelo LSTM bidirecional
 model = Sequential()
-model.add(Bidirectional(LSTM(units=64, return_sequences=True), input_shape=(LSTM_WINDOW, 2)))
+model.add(SimpleRNN(units=64, return_sequences=True, input_shape=(LSTM_WINDOW, input_dim)))
+model.add(Bidirectional(LSTM(units=128, return_sequences=True)))  # aumenta para 128 unidades
+model.add(Dropout(0.2))
+model.add(Bidirectional(LSTM(units=64, return_sequences=True)))  # adiciona outra camada LSTM com 64 unidades
 model.add(Dropout(0.2))
 model.add(Bidirectional(LSTM(units=32)))
 model.add(Dropout(0.2))
 model.add(Dense(1))
+
 
 model.summary()
 
@@ -185,8 +187,9 @@ early_stop = EarlyStopping(monitor='val_loss', patience=2)
 model.compile(optimizer='adam', loss='mean_squared_error')
 model.fit(x_train, y_train, batch_size=BATCH_SIZE, epochs=EPOCHS, validation_data=(x_test, y_test), callbacks=[early_stop])
 
-print ("CALCULANDO AS PREVISOES...")
+print ("CALCULANDO AS PREVISOES PARA O PROXIMO DIA...")
 
+# Faz a previsão dos valores do par de negociação para os próximos dias_prev dias
 # Faz a previsão dos valores do par de negociação para os próximos dias_prev dias
 predicted_values = []
 
@@ -204,39 +207,37 @@ for i in range(dias_prev * 24):  # prevendo os próximos "dias_prev" dias, hora 
     else:
         last_sequence[-1, -1] = y_test[i] # Insere o valor real no lugar do valor previsto para datas futuras
 
-
-
-# Reverte a normalização para 'close'
+# Reverte a normalização
 predicted_values = np.array(predicted_values).reshape(-1, 1)
 predicted_values = scaler_close.inverse_transform(predicted_values)
 y_test = y_test.reshape(-1, 1)
 y_test = scaler_close.inverse_transform(y_test)
 
-# Adiciona a coluna 'timestamp' ao DataFrame 'df'
-df['timestamp'] = pd.date_range(start=fim_dt + pd.Timedelta(hours=1), periods=len(predicted_values), freq='H')
+# Cria uma lista com as datas correspondentes à previsão
+prev_dates = pd.date_range(start=df_original['timestamp'].iloc[-1] + timedelta(hours=1), periods=dias_prev * 24, freq='H').tolist()
 
 # Cria um DataFrame para exibir os valores previstos e os valores reais dos últimos dias
 print(f"Tamanho dos arrays - previsto: {len(predicted_values)} / real: {len(y_test)}")
-df_prev = pd.DataFrame({'timestamp': df['timestamp'], 'Valor Previsto': predicted_values.ravel()})
+df_prev = pd.DataFrame({'timestamp': prev_dates, 'Valor Previsto': predicted_values.ravel()})
 
-print(df_prev)
-
+# Cria o gráfico
+fig, ax = plt.subplots(figsize=(12, 8))
 
 # Plot dos valores de 'close' da amostragem
-plt.plot(df_original['timestamp'], df_original['close'], color='blue')
-plt.plot(df_prev['timestamp'], df_prev['Valor Previsto'], linestyle='--', color='green')
-plt.plot(df_prev['timestamp'], df_prev['Valor Previsto'], linestyle='--', color='red')
-
-# Adiciona a linha que representa o início dos dados de teste
-plt.axvline(df_original['timestamp'].iloc[train_size], color='black', linestyle='--')
+ax.plot(df_original['timestamp'], df_original['close'], color='blue')
+ax.plot(df_prev['timestamp'], df_prev['Valor Previsto'], linestyle='--', color='red')
 
 # Configurações do gráfico
-plt.xlabel('Data')
-plt.ylabel('Preço')
-plt.title('Preço do par de negociação ao longo do tempo')
+ax.set_ylabel('Preço')
+ax.set_title('Previsão do preço do par de negociação')
 
-# Legenda
-plt.legend(['Dados de Treinamento', 'Valores Previstos', 'Dados de Teste'])
+# Define o intervalo do eixo x para mostrar apenas as últimas 24 horas
+last_24_hours = pd.date_range(end=df_prev['timestamp'].iloc[-1], periods=24, freq='H')
+ax.set_xlim(last_24_hours[0], last_24_hours[-1])
 
 # Mostra o gráfico
 plt.show()
+
+# Imprime os valores previstos para as próximas 24 horas
+print("Valores previstos para as próximas 24 horas:")
+print(df_prev.tail(24).to_string(index=False))
