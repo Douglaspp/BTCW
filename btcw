@@ -20,7 +20,8 @@ from datetime import datetime, timedelta
 from tensorflow.keras.layers import Dropout
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras.layers import SimpleRNN
-
+from tensorflow.keras.layers import BatchNormalization
+from tensorflow.keras.optimizers import Adam
 
 
 # Definição dos parâmetros
@@ -31,7 +32,7 @@ EPOCHS = 10
 INTERVAL = '1h'  # intervalo de 1 HORA
 LSTM_WINDOW = 20 # janela de 60 dias para a LSTM
 LIMIT = 1000  # limite de 1000 barras (máximo permitido)
-input_dim = 2
+input_dim = 3
 data_range = timedelta(days=365)
 
 # Define o fuso horário para o horário de Brasília
@@ -49,7 +50,7 @@ exchange = getattr(ccxt, exchange_name)()
 # Converte as datas para timestamp em milissegundos
 # Define o período de busca dos dados
 fim_dt = datetime.now()
-inicio_dt = fim_dt - timedelta(days=365)
+inicio_dt = fim_dt - timedelta(days=90)
 
 # Converte as datas para timestamp em milissegundos
 inicio_ts = int(inicio_dt.timestamp() * 1000)
@@ -111,11 +112,14 @@ df_original = df.copy()
 
 
 # Seleciona apenas as colunas relevantes e converte em um array NumPy
-data = df[['close']].to_numpy()
+#data = df[['close']].to_numpy()
 
 # Calcular o indicador técnico RSI
 rsi_indicator = RSIIndicator(close = df['close'], window = 14)
 df['RSI'] = rsi_indicator.rsi()
+
+macd_indicator = ta.trend.MACD(df['close'], window_slow=26, window_fast=12, window_sign=9)
+df['MACD'] = macd_indicator.macd()
 
 # Remove os valores NaN do DataFrame
 df = df.dropna().reset_index(drop=True)
@@ -132,6 +136,10 @@ df[['close']] = scaler_close.fit_transform(df[['close']].values)
 scaler_rsi = MinMaxScaler()
 df[['RSI']] = scaler_rsi.fit_transform(df[['RSI']].values)
 
+# Cria um novo scaler para a coluna 'MACD'
+scaler_macd = MinMaxScaler()
+df[['MACD']] = scaler_macd.fit_transform(df[['MACD']].values)
+
 def create_sequences(data, window):
     xs = []
     ys = []
@@ -142,7 +150,9 @@ def create_sequences(data, window):
 
     return np.array(xs), np.array(ys)
 
-data = df[['close', 'RSI']].to_numpy()
+#data = df[['close', 'RSI']].to_numpy()
+
+data = df[['close', 'RSI', 'MACD']].to_numpy()
 
 # Calcula a quantidade de dias para a previsão
 dias_prev = 1
@@ -161,17 +171,17 @@ x_train, y_train = create_sequences(train_data, LSTM_WINDOW)
 x_test, y_test = create_sequences(test_data, LSTM_WINDOW)
 
 # Redimensiona os arrays para terem a forma correta para a LSTM
-x_train = x_train.reshape((x_train.shape[0], x_train.shape[1], 2))
-x_test = x_test.reshape((x_test.shape[0], x_test.shape[1], 2))
+x_train = x_train.reshape((x_train.shape[0], x_train.shape[1], 3))
+x_test = x_test.reshape((x_test.shape[0], x_test.shape[1], 3))
 
 # Cria o modelo LSTM bidirecional
 model = Sequential()
 model.add(SimpleRNN(units=64, return_sequences=True, input_shape=(LSTM_WINDOW, input_dim)))
-model.add(Bidirectional(LSTM(units=128, return_sequences=True)))  # aumenta para 128 unidades
+model.add(Bidirectional(LSTM(units=32, return_sequences=True)))
+model.add(BatchNormalization())
 model.add(Dropout(0.2))
-model.add(Bidirectional(LSTM(units=64, return_sequences=True)))  # adiciona outra camada LSTM com 64 unidades
-model.add(Dropout(0.2))
-model.add(Bidirectional(LSTM(units=32)))
+model.add(Bidirectional(LSTM(units=16)))
+#model.add(BatchNormalization())
 model.add(Dropout(0.2))
 model.add(Dense(1))
 
@@ -181,10 +191,10 @@ model.summary()
 print("TREINANDO A REDE NEURAL BI-LSTM...")
 
 # Cria um objeto EarlyStopping
-early_stop = EarlyStopping(monitor='val_loss', patience=2)
+early_stop = EarlyStopping(monitor='val_loss', patience=4)
 
 # Compila e treina o modelo com EarlyStopping
-model.compile(optimizer='adam', loss='mean_squared_error')
+model.compile(optimizer=Adam(learning_rate=0.001), loss='mean_squared_error')
 model.fit(x_train, y_train, batch_size=BATCH_SIZE, epochs=EPOCHS, validation_data=(x_test, y_test), callbacks=[early_stop])
 
 print ("CALCULANDO AS PREVISOES PARA O PROXIMO DIA...")
